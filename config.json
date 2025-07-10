@@ -1,7 +1,7 @@
 {
   "telegram": {
-    "bot_token": "7212303252:AAHAxLVx7DofpM7Vmm-crq9Z9FAxTzHicj4",
-    "chat_id": "5271109633"
+    "bot_token": "",
+    "chat_id": ""
   },
   "schedule": {
     "execution_times": [
