@@ -10,6 +10,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 import jwt
 from pathlib import Path
+import io
 import os
 
 # Configuration du logging
@@ -24,10 +25,10 @@ logging.basicConfig(
 
 
 class ConfigManager:
-    """Gestionnaire de configuration"""
+    """Gestionnaire de configuration avec persistance sur disque"""
 
     def __init__(self):
-        self.config_file = "config.json"
+        self.config_file = Path("gurufocus_config.json")
         self.default_config = {
             "telegram": {
                 "bot_token": "",
@@ -39,28 +40,38 @@ class ConfigManager:
             "portfolio": []
         }
 
-    def load_config(self):
-        """Charge la configuration depuis le fichier JSON"""
-        try:
-            if Path(self.config_file).exists():
+    def get_config(self):
+        """Récupère la configuration depuis le fichier ou retourne la config par défaut"""
+        if self.config_file.exists():
+            try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            return self.default_config
-        except Exception as e:
-            logging.error(
-                f"Erreur lors du chargement de la configuration: {e}")
-            return self.default_config
+            except Exception as e:
+                print(f"Erreur lors de la lecture du fichier de config: {e}")
+                return self.default_config.copy()
+        else:
+            return self.default_config.copy()
 
-    def save_config(self, config):
-        """Sauvegarde la configuration dans le fichier JSON"""
+    def update_config(self, config):
+        """Met à jour la configuration et la sauvegarde sur disque"""
         try:
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
             return True
         except Exception as e:
-            logging.error(
-                f"Erreur lors de la sauvegarde de la configuration: {e}")
+            print(f"Erreur lors de la sauvegarde de la config: {e}")
             return False
+
+    def load_from_file(self, file_content):
+        """Charge la configuration depuis un fichier JSON et la sauvegarde"""
+        try:
+            config_data = json.loads(file_content)
+            if self.update_config(config_data):
+                return True, "Configuration chargée et sauvegardée avec succès!"
+            else:
+                return False, "Erreur lors de la sauvegarde de la configuration"
+        except Exception as e:
+            return False, f"Erreur lors du chargement: {e}"
 
 
 class GuruFocusAPI:
@@ -238,7 +249,7 @@ Ticker      | Prix    | GF Val  | %Val   | Pos
                 prix = f"{item['current_price']:.2f}" if item['current_price'] else "N/A"
                 gf_val = f"{item['gf_value']:.2f}" if item['gf_value'] else "N/A"
                 valuation = f"{item['valuation']:.1f}%" if item['valuation'] else "N/A"
-                position = "✅" if item.get('in_portfolio', True) else "❌"
+                position = "✅" if item.get('in_portfolio', False) else "❌"
 
                 line = f"\n{ticker:<11} | {prix:>7} | {gf_val:>7} | {valuation:>6} | {position}"
                 table += line
@@ -247,16 +258,35 @@ Ticker      | Prix    | GF Val  | %Val   | Pos
         return table
 
 
-class SchedulerManager:
-    """Gestionnaire de planification"""
+class BackgroundScheduler:
+    """Gestionnaire de planification en arrière-plan persistant"""
+
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
 
     def __init__(self):
-        self.running = False
-        self.thread = None
-        self.schedule_times = []
+        if not self._initialized:
+            self.running = False
+            self.thread = None
+            self.schedule_times = []
+            self.callback_func = None
+            self.config_manager = None
+            self._initialized = True
 
-    def start_scheduler(self, execution_times: list, callback_func):
-        """Démarre le planificateur"""
+    def set_config_manager(self, config_manager):
+        """Définit le gestionnaire de configuration"""
+        self.config_manager = config_manager
+
+    def start_scheduler(self, execution_times: list, callback_func, config_manager):
+        """Démarre le planificateur en arrière-plan"""
         if self.running:
             self.stop_scheduler()
 
@@ -268,28 +298,44 @@ class SchedulerManager:
             schedule.every().day.at(time_str).do(callback_func)
 
         self.schedule_times = execution_times
+        self.callback_func = callback_func
+        self.config_manager = config_manager
         self.running = True
 
-        # Démarrer le thread
-        self.thread = threading.Thread(target=self._run_scheduler, daemon=True)
+        # Démarrer le thread en daemon pour qu'il continue même sans interface
+        self.thread = threading.Thread(
+            target=self._run_scheduler, daemon=False)
         self.thread.start()
 
         logging.info(
-            f"Planificateur démarré - Exécution quotidienne à {execution_times}")
+            f"Planificateur en arrière-plan démarré - Exécution quotidienne à {execution_times}")
 
     def stop_scheduler(self):
         """Arrête le planificateur"""
         self.running = False
         schedule.clear()
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1)
+            # Ne pas joindre le thread car il doit continuer à tourner
+            pass
         logging.info("Planificateur arrêté")
 
+    def is_running(self):
+        """Vérifie si le planificateur est en cours d'exécution"""
+        return self.running and self.thread and self.thread.is_alive()
+
     def _run_scheduler(self):
-        """Boucle principale du planificateur"""
+        """Boucle principale du planificateur qui tourne en permanence"""
         while self.running:
-            schedule.run_pending()
-            time.sleep(60)  # Vérification toutes les minutes
+            try:
+                schedule.run_pending()
+                time.sleep(60)  # Vérification toutes les minutes
+            except Exception as e:
+                logging.error(f"Erreur dans le planificateur: {e}")
+                time.sleep(60)
+
+
+# Instance globale du planificateur
+background_scheduler = BackgroundScheduler()
 
 
 class GuruFocusApp:
@@ -298,21 +344,21 @@ class GuruFocusApp:
     def __init__(self):
         self.config_manager = ConfigManager()
         self.guru_api = GuruFocusAPI()
-        self.scheduler = SchedulerManager()
+        self.scheduler = background_scheduler
         self.telegram_bot = None
 
-        # Initialiser le state
-        if 'config' not in st.session_state:
-            st.session_state.config = self.config_manager.load_config()
+        # Initialiser la configuration depuis le cache persistant
+        self.config = self.config_manager.get_config()
 
-        if 'scheduler_running' not in st.session_state:
-            st.session_state.scheduler_running = False
-
+        # Initialiser les states pour l'interface seulement
         if 'last_execution' not in st.session_state:
             st.session_state.last_execution = None
 
         if 'portfolio_data' not in st.session_state:
             st.session_state.portfolio_data = []
+
+        # Configurer le planificateur avec le gestionnaire de config
+        self.scheduler.set_config_manager(self.config_manager)
 
     def run(self):
         """Lance l'application Streamlit"""
@@ -352,7 +398,39 @@ class GuruFocusApp:
 
     def _render_config_section(self):
         """Affiche la section de configuration"""
-        st.subheader("Fichier de configuration")
+        st.subheader("📁 Importer Configuration")
+
+        # Vérifier si une configuration existe
+        config_exists = (self.config.get('telegram', {}).get('bot_token') or
+                         self.config.get('portfolio'))
+
+        if config_exists:
+            st.success("✅ Configuration chargée")
+
+            # Afficher un résumé de la configuration
+            with st.expander("Voir le résumé de la configuration"):
+                telegram_config = self.config.get('telegram', {})
+                portfolio_config = self.config.get('portfolio', [])
+                schedule_config = self.config.get('schedule', {})
+
+                st.write("**Telegram:**")
+                st.write(
+                    f"- Bot Token: {'✅ Configuré' if telegram_config.get('bot_token') else '❌ Non configuré'}")
+                st.write(
+                    f"- Chat ID: {telegram_config.get('chat_id', 'Non configuré')}")
+
+                st.write("**Portfolio:**")
+                st.write(f"- Nombre d'actions: {len(portfolio_config)}")
+                if portfolio_config:
+                    tickers = [p['ticker'] for p in portfolio_config]
+                    st.write(f"- Tickers: {', '.join(tickers)}")
+
+                st.write("**Planification:**")
+                execution_times = schedule_config.get('execution_times', [])
+                st.write(f"- Heures d'exécution: {', '.join(execution_times)}")
+        else:
+            st.info(
+                "ℹ️ Aucune configuration chargée. Veuillez importer un fichier de configuration.")
 
         uploaded_file = st.file_uploader(
             "Charger un fichier de configuration JSON",
@@ -361,156 +439,146 @@ class GuruFocusApp:
         )
 
         if uploaded_file is not None:
-            try:
-                config_data = json.load(uploaded_file)
-                st.session_state.config = config_data
-                self.config_manager.save_config(config_data)
-                st.success("Configuration chargée avec succès!")
-            except Exception as e:
-                st.error(f"Erreur lors du chargement: {e}")
+            file_content = uploaded_file.read().decode('utf-8')
+            success, message = self.config_manager.load_from_file(file_content)
 
-        # Configuration
-        telegram_token = st.session_state.config.get(
-            'telegram', {}).get('bot_token', '')
+            if success:
+                # Recharger la configuration
+                self.config = self.config_manager.get_config()
+                st.success(message)
+            else:
+                st.error(message)
 
-        telegram_chat_id = st.session_state.config.get(
-            'telegram', {}).get('chat_id', '')
-
-        if st.button("Sauvegarder Configuration"):
-            self.config_manager.save_config(st.session_state.config)
-            st.success("Configuration Telegram sauvegardée!")
-
-        # Test Telegram
-        if st.button("Tester Telegram"):
-            if telegram_token and telegram_chat_id:
-                bot = TelegramBot(telegram_token, telegram_chat_id)
+        # Test Telegram (seulement si configuré)
+        telegram_config = self.config.get('telegram', {})
+        if telegram_config.get('bot_token') and telegram_config.get('chat_id'):
+            if st.button("🧪 Tester Telegram"):
+                bot = TelegramBot(
+                    telegram_config['bot_token'], telegram_config['chat_id'])
                 test_data = [{'ticker': 'TEST', 'success': True, 'current_price': 100.0,
                               'gf_value': 95.0, 'valuation': 5.3, 'in_portfolio': True}]
                 if bot.send_message(test_data):
                     st.success("Message de test envoyé avec succès!")
                 else:
                     st.error("Erreur lors de l'envoi du message de test")
-            else:
-                st.error("Veuillez saisir le token et le chat ID")
 
     def _render_scheduler_section(self):
         """Affiche la section du planificateur"""
-        current_times = st.session_state.config.get(
-            'schedule', {}).get('execution_times', ['07:25', '19:35'])
+        # Vérifier si une configuration existe
+        if not self.config.get('telegram', {}).get('bot_token'):
+            st.warning(
+                "⚠️ Configuration Telegram manquante. Importez d'abord une configuration.")
+            return
 
-        # Modification des heures
-        new_times = []
+        current_times = self.config.get('schedule', {}).get(
+            'execution_times', ['07:25', '19:35'])
+
+        # Affichage des heures actuelles
+        st.markdown("**Heures d'exécution programmées:**")
         for i, time_str in enumerate(current_times):
-            new_time = st.time_input(
-                f"Heure {i+1}", value=datetime.strptime(time_str, '%H:%M').time())
-            new_times.append(new_time.strftime('%H:%M'))
+            st.markdown(f"- {time_str}")
 
-        # Ajouter une nouvelle heure
-        if st.button("Ajouter une heure"):
-            new_times.append("12:00")
+        # Statut du planificateur
+        is_running = self.scheduler.is_running()
+        status = "🟢 Actif" if is_running else "🔴 Inactif"
+        st.markdown(f"**Statut du planificateur:** {status}")
 
-        # Supprimer la dernière heure
-        if len(new_times) > 1 and st.button("Supprimer dernière heure"):
-            new_times.pop()
-
-        # Sauvegarder les heures
-        if st.button("Sauvegarder Horaires"):
-            st.session_state.config['schedule']['execution_times'] = new_times
-            self.config_manager.save_config(st.session_state.config)
-            st.success("Horaires sauvegardés!")
+        if is_running:
+            st.success(
+                "✅ Le bot fonctionne en arrière-plan et continuera même si vous fermez cette page")
+            st.markdown(
+                f"**Prochaines exécutions:** {', '.join(current_times)}")
 
         # Contrôle du planificateur
         col1, col2 = st.columns(2)
 
         with col1:
-            if st.button("▶️ Démarrer", disabled=st.session_state.scheduler_running):
-                if self._start_scheduler():
-                    st.session_state.scheduler_running = True
-                    st.success("Planificateur démarré!")
+            if st.button("▶️ Démarrer Bot", disabled=is_running):
+                if self._start_background_scheduler():
+                    st.success("Planificateur démarré en arrière-plan!")
+                    st.rerun()
                 else:
                     st.error("Erreur lors du démarrage")
 
         with col2:
-            if st.button("⏹️ Arrêter", disabled=not st.session_state.scheduler_running):
+            if st.button("⏹️ Arrêter Bot", disabled=not is_running):
                 self.scheduler.stop_scheduler()
-                st.session_state.scheduler_running = False
                 st.success("Planificateur arrêté!")
-
-        # Statut
-        status = "🟢 Actif" if st.session_state.scheduler_running else "🔴 Inactif"
-        st.markdown(f"**Statut:** {status}")
-
-        if st.session_state.scheduler_running:
-            st.markdown(f"**Prochaines exécutions:** {', '.join(new_times)}")
+                st.rerun()
 
         # Exécution manuelle
+        st.markdown("---")
         if st.button("🚀 Exécuter Maintenant"):
-            self._execute_portfolio_analysis()
+            with st.spinner("Analyse en cours..."):
+                self._execute_portfolio_analysis()
+                st.success(
+                    "Analyse terminée! Vérifiez les résultats ci-dessous.")
 
     def _render_portfolio_section(self):
         """Affiche la section du portfolio"""
-        # Gestion du portfolio
-        portfolio = st.session_state.config.get('portfolio', [])
+        # Vérifier si une configuration existe
+        if not self.config.get('portfolio'):
+            st.info(
+                "ℹ️ Aucun portfolio configuré. Importez d'abord une configuration.")
+            return
 
-        # Ajouter un nouveau ticker
-        col1, col2, col3 = st.columns([2, 1, 1])
-
-        with col1:
-            new_ticker = st.text_input(
-                "Nouveau ticker", placeholder="Ex: AAPL").upper()
-
-        with col2:
-            in_portfolio = st.checkbox("Dans le portfolio", value=True)
-
-        with col3:
-            if st.button("Ajouter"):
-                if new_ticker and new_ticker not in [p['ticker'] for p in portfolio]:
-                    portfolio.append(
-                        {'ticker': new_ticker, 'in_portfolio': in_portfolio})
-                    st.session_state.config['portfolio'] = portfolio
-                    self.config_manager.save_config(st.session_state.config)
-                    st.success(f"Ticker {new_ticker} ajouté!")
-                    st.rerun()
-
-        # Affichage du portfolio
+        # Affichage du portfolio (lecture seule)
+        portfolio = self.config.get('portfolio', [])
+        print(portfolio)
         if portfolio:
-            df = pd.DataFrame(portfolio)
-            edited_df = st.data_editor(
-                df,
-                column_config={
-                    "ticker": st.column_config.TextColumn("Ticker", disabled=True),
-                    "in_portfolio": st.column_config.CheckboxColumn("Dans le portfolio")
-                },
-                hide_index=True,
-                use_container_width=True
-            )
+            st.subheader("📊 Portfolio configuré")
 
-            # Sauvegarder les modifications
-            if st.button("Sauvegarder Portfolio"):
-                st.session_state.config['portfolio'] = edited_df.to_dict(
-                    'records')
-                self.config_manager.save_config(st.session_state.config)
-                st.success("Portfolio sauvegardé!")
+            # Convertir en DataFrame pour affichage
+            df = pd.DataFrame(portfolio)
+            print(df)
+            df['Statut'] = df['in_portfolio'].apply(
+                lambda x: '✅ Dans portfolio' if x else '❌ Hors portfolio')
+
+            # Afficher le tableau en lecture seule
+            display_df = df[['ticker', 'Statut']].rename(
+                columns={'ticker': 'Ticker'})
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            # Statistiques du portfolio
+            total_stocks = len(portfolio)
+            portfolio_stocks = len(
+                [p for p in portfolio if p.get('in_portfolio', False)])
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Actions", total_stocks)
+            with col2:
+                st.metric("Dans Portfolio", portfolio_stocks)
 
         # Affichage des dernières données
         if st.session_state.portfolio_data:
-            st.subheader("Dernières données récupérées")
+            st.subheader("📈 Dernières données récupérées")
 
             # Convertir en DataFrame pour affichage
             display_data = []
             for item in st.session_state.portfolio_data:
                 if item.get('success', False):
+                    valuation_color = "🟢" if item.get(
+                        'valuation', 0) < 0 else "🔴"
                     display_data.append({
                         'Ticker': item['ticker'],
                         'Prix Actuel': f"${item.get('current_price', 0):.2f}",
                         'Valeur GF': f"${item.get('gf_value', 0):.2f}",
-                        'Valorisation': f"{item.get('valuation', 0):.1f}%",
-                        'Dans Portfolio': "✅" if item.get('in_portfolio', False) else "❌"
+                        'Valorisation': f"{valuation_color} {item.get('valuation', 0):.1f}%",
+                        'Portfolio': "✅" if item.get('in_portfolio', False) else "❌"
                     })
 
             if display_data:
                 st.dataframe(pd.DataFrame(display_data),
-                             use_container_width=True)
+                             use_container_width=True, hide_index=True)
+
+                # Timestamp de la dernière mise à jour
+                if st.session_state.last_execution:
+                    st.caption(
+                        f"Dernière mise à jour: {st.session_state.last_execution.strftime('%d/%m/%Y à %H:%M')}")
+            else:
+                st.warning(
+                    "Aucune donnée valide récupérée lors de la dernière exécution.")
 
     def _render_stats_section(self):
         """Affiche la section des statistiques"""
@@ -561,35 +629,42 @@ class GuruFocusApp:
         except Exception as e:
             st.error(f"Erreur lors de la lecture des logs: {e}")
 
-    def _start_scheduler(self) -> bool:
-        """Démarre le planificateur"""
+    def _start_background_scheduler(self) -> bool:
+        """Démarre le planificateur en arrière-plan"""
         try:
-            execution_times = st.session_state.config.get(
+            execution_times = self.config.get(
                 'schedule', {}).get('execution_times', [])
             if not execution_times:
                 st.error("Aucune heure d'exécution configurée")
                 return False
 
             # Vérifier la configuration Telegram
-            telegram_config = st.session_state.config.get('telegram', {})
+            telegram_config = self.config.get('telegram', {})
             if not telegram_config.get('bot_token') or not telegram_config.get('chat_id'):
                 st.error("Configuration Telegram incomplète")
                 return False
 
+            # Créer une fonction d'exécution qui utilise la configuration cachée
+            def execute_with_cached_config():
+                self._execute_portfolio_analysis_background()
+
             self.scheduler.start_scheduler(
-                execution_times, self._execute_portfolio_analysis)
+                execution_times, execute_with_cached_config, self.config_manager)
             return True
 
         except Exception as e:
             logging.error(f"Erreur lors du démarrage du planificateur: {e}")
             return False
 
-    def _execute_portfolio_analysis(self):
-        """Exécute l'analyse du portfolio"""
+    def _execute_portfolio_analysis_background(self):
+        """Exécute l'analyse du portfolio en arrière-plan avec la config cachée"""
         try:
-            logging.info("Début de l'analyse du portfolio")
+            logging.info("Début de l'analyse du portfolio (arrière-plan)")
 
-            portfolio = st.session_state.config.get('portfolio', [])
+            # Récupérer la configuration depuis le cache
+            current_config = self.config_manager.get_config()
+            portfolio = current_config.get('portfolio', [])
+
             if not portfolio:
                 logging.warning("Aucun ticker dans le portfolio")
                 return
@@ -603,21 +678,57 @@ class GuruFocusApp:
                 portfolio_data.append(data)
                 time.sleep(1)  # Pause entre les requêtes
 
-            # Sauvegarder les données
-            st.session_state.portfolio_data = portfolio_data
-            st.session_state.last_execution = datetime.now()
-
             # Envoyer via Telegram
-            telegram_config = st.session_state.config.get('telegram', {})
+            telegram_config = current_config.get('telegram', {})
             if telegram_config.get('bot_token') and telegram_config.get('chat_id'):
                 bot = TelegramBot(
                     telegram_config['bot_token'], telegram_config['chat_id'])
                 bot.send_message(portfolio_data)
 
-            logging.info("Analyse du portfolio terminée avec succès")
+            logging.info(
+                "Analyse du portfolio terminée avec succès (arrière-plan)")
 
         except Exception as e:
-            logging.error(f"Erreur lors de l'analyse du portfolio: {e}")
+            logging.error(
+                f"Erreur lors de l'analyse du portfolio (arrière-plan): {e}")
+
+    def _execute_portfolio_analysis(self):
+        """Exécute l'analyse du portfolio pour l'interface utilisateur"""
+        try:
+            logging.info("Début de l'analyse du portfolio (interface)")
+
+            portfolio = self.config.get('portfolio', [])
+            if not portfolio:
+                st.warning("Aucun ticker dans le portfolio")
+                return
+
+            # Récupérer les données
+            portfolio_data = []
+            for stock in portfolio:
+                ticker = stock['ticker']
+                data = self.guru_api.get_stock_data(ticker)
+                data['in_portfolio'] = stock.get('in_portfolio', False)
+                portfolio_data.append(data)
+                time.sleep(1)  # Pause entre les requêtes
+
+            # Sauvegarder les données pour l'interface
+            st.session_state.portfolio_data = portfolio_data
+            st.session_state.last_execution = datetime.now()
+
+            # Envoyer via Telegram
+            telegram_config = self.config.get('telegram', {})
+            if telegram_config.get('bot_token') and telegram_config.get('chat_id'):
+                bot = TelegramBot(
+                    telegram_config['bot_token'], telegram_config['chat_id'])
+                bot.send_message(portfolio_data)
+
+            logging.info(
+                "Analyse du portfolio terminée avec succès (interface)")
+
+        except Exception as e:
+            logging.error(
+                f"Erreur lors de l'analyse du portfolio (interface): {e}")
+            st.error(f"Erreur lors de l'analyse: {e}")
 
 
 def main():
