@@ -37,7 +37,12 @@ class ConfigManager:
             "schedule": {
                 "execution_times": ["07:25", "19:35"]
             },
-            "portfolio": []
+            "portfolio": [],
+            "scheduler_status": {
+                "running": False,
+                "last_execution": None,
+                "execution_in_progress": False
+            }
         }
 
     def get_config(self):
@@ -45,7 +50,12 @@ class ConfigManager:
         if self.config_file.exists():
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    config = json.load(f)
+                    # S'assurer que scheduler_status existe
+                    if 'scheduler_status' not in config:
+                        config['scheduler_status'] = self.default_config['scheduler_status'].copy(
+                        )
+                    return config
             except Exception as e:
                 print(f"Erreur lors de la lecture du fichier de config: {e}")
                 return self.default_config.copy()
@@ -62,10 +72,42 @@ class ConfigManager:
             print(f"Erreur lors de la sauvegarde de la config: {e}")
             return False
 
+    def update_scheduler_status(self, running=None, execution_in_progress=None, last_execution=None):
+        """Met à jour uniquement le statut du planificateur"""
+        config = self.get_config()
+
+        if running is not None:
+            config['scheduler_status']['running'] = running
+        if execution_in_progress is not None:
+            config['scheduler_status']['execution_in_progress'] = execution_in_progress
+        if last_execution is not None:
+            config['scheduler_status']['last_execution'] = last_execution.isoformat(
+            ) if last_execution else None
+
+        return self.update_config(config)
+
+    def is_execution_in_progress(self):
+        """Vérifie si une exécution est en cours"""
+        config = self.get_config()
+        return config.get('scheduler_status', {}).get('execution_in_progress', False)
+
+    def is_scheduler_running(self):
+        """Vérifie si le planificateur est marqué comme actif"""
+        config = self.get_config()
+        return config.get('scheduler_status', {}).get('running', False)
+
     def load_from_file(self, file_content):
         """Charge la configuration depuis un fichier JSON et la sauvegarde"""
         try:
             config_data = json.loads(file_content)
+            # Préserver le statut du planificateur existant
+            current_config = self.get_config()
+            if 'scheduler_status' in current_config:
+                config_data['scheduler_status'] = current_config['scheduler_status']
+            else:
+                config_data['scheduler_status'] = self.default_config['scheduler_status'].copy(
+                )
+
             if self.update_config(config_data):
                 return True, "Configuration chargée et sauvegardée avec succès!"
             else:
@@ -259,7 +301,7 @@ Ticker      | Prix    | GF Val  | %Val   | Pos
 
 
 class BackgroundScheduler:
-    """Gestionnaire de planification en arrière-plan persistant"""
+    """Gestionnaire de planification en arrière-plan persistant avec verrou d'exécution"""
 
     _instance = None
     _lock = threading.Lock()
@@ -279,6 +321,8 @@ class BackgroundScheduler:
             self.schedule_times = []
             self.callback_func = None
             self.config_manager = None
+            # Verrou pour éviter les exécutions multiples
+            self.execution_lock = threading.Lock()
             self._initialized = True
 
     def set_config_manager(self, config_manager):
@@ -289,49 +333,171 @@ class BackgroundScheduler:
         """Démarre le planificateur en arrière-plan"""
         if self.running:
             self.stop_scheduler()
+            time.sleep(1)
 
         # Nettoyer les anciens jobs
         schedule.clear()
 
-        # Programmer les nouveaux jobs
+        # Créer une fonction wrapper avec verrou d'exécution
+        def safe_callback():
+            # Vérifier si une exécution est déjà en cours
+            if self.config_manager.is_execution_in_progress():
+                logging.warning("Exécution déjà en cours - Ignorée")
+                return
+
+            # Utiliser le verrou local également pour double sécurité
+            with self.execution_lock:
+                if self.config_manager.is_execution_in_progress():
+                    logging.warning(
+                        "Exécution déjà en cours (double vérification) - Ignorée")
+                    return
+
+                try:
+                    # Marquer l'exécution comme en cours
+                    self.config_manager.update_scheduler_status(
+                        execution_in_progress=True)
+                    logging.info("=== DÉBUT EXÉCUTION PLANIFIÉE ===")
+
+                    # Exécuter le callback
+                    callback_func()
+
+                    # Marquer la dernière exécution
+                    self.config_manager.update_scheduler_status(
+                        execution_in_progress=False,
+                        last_execution=datetime.now()
+                    )
+                    logging.info("=== FIN EXÉCUTION PLANIFIÉE ===")
+
+                except Exception as e:
+                    logging.error(f"Erreur lors de l'exécution planifiée: {e}")
+                    # S'assurer de libérer le verrou même en cas d'erreur
+                    self.config_manager.update_scheduler_status(
+                        execution_in_progress=False)
+
+        # Programmer les nouveaux jobs avec la fonction sécurisée
         for time_str in execution_times:
-            schedule.every().day.at(time_str).do(callback_func)
+            schedule.every().day.at(time_str).do(safe_callback)
+            logging.info(f"Job programmé à {time_str}")
 
         self.schedule_times = execution_times
         self.callback_func = callback_func
         self.config_manager = config_manager
         self.running = True
 
-        # Démarrer le thread en daemon pour qu'il continue même sans interface
-        self.thread = threading.Thread(
-            target=self._run_scheduler, daemon=False)
+        # Marquer le planificateur comme actif dans la config
+        self.config_manager.update_scheduler_status(running=True)
+
+        # Démarrer le thread
+        self.thread = threading.Thread(target=self._run_scheduler, daemon=True)
         self.thread.start()
 
         logging.info(
             f"Planificateur en arrière-plan démarré - Exécution quotidienne à {execution_times}")
 
+        if self.thread.is_alive():
+            logging.info("Thread du planificateur confirmé comme actif")
+            return True
+        else:
+            logging.error("Échec du démarrage du thread du planificateur")
+            self.config_manager.update_scheduler_status(running=False)
+            return False
+
     def stop_scheduler(self):
         """Arrête le planificateur"""
         self.running = False
         schedule.clear()
+
+        # Marquer le planificateur comme inactif dans la config
+        if self.config_manager:
+            self.config_manager.update_scheduler_status(
+                running=False, execution_in_progress=False)
+
         if self.thread and self.thread.is_alive():
-            # Ne pas joindre le thread car il doit continuer à tourner
-            pass
+            logging.info("Arrêt du planificateur en cours...")
+            self.thread.join(timeout=2)
         logging.info("Planificateur arrêté")
 
     def is_running(self):
         """Vérifie si le planificateur est en cours d'exécution"""
-        return self.running and self.thread and self.thread.is_alive()
+        # Vérifier à la fois le statut local et le statut persistant
+        local_running = self.running and self.thread and self.thread.is_alive()
+        config_running = self.config_manager.is_scheduler_running(
+        ) if self.config_manager else False
+
+        # Si les statuts sont incohérents, corriger
+        if local_running != config_running:
+            if self.config_manager:
+                self.config_manager.update_scheduler_status(
+                    running=local_running)
+
+        return local_running
+
+    def get_execution_status(self):
+        """Retourne l'état d'exécution détaillé"""
+        if not self.config_manager:
+            return {}
+
+        config = self.config_manager.get_config()
+        scheduler_status = config.get('scheduler_status', {})
+
+        last_execution_str = scheduler_status.get('last_execution')
+        last_execution = None
+        if last_execution_str:
+            try:
+                last_execution = datetime.fromisoformat(last_execution_str)
+            except:
+                pass
+
+        return {
+            'running': scheduler_status.get('running', False),
+            'execution_in_progress': scheduler_status.get('execution_in_progress', False),
+            'last_execution': last_execution,
+            'next_execution': self.get_next_execution(),
+            'thread_alive': self.thread.is_alive() if self.thread else False
+        }
+
+    def get_next_execution(self):
+        """Retourne la prochaine heure d'exécution"""
+        if not self.schedule_times:
+            return None
+
+        now = datetime.now()
+        today_executions = []
+
+        for time_str in self.schedule_times:
+            hour, minute = map(int, time_str.split(':'))
+            exec_time = now.replace(
+                hour=hour, minute=minute, second=0, microsecond=0)
+
+            if exec_time <= now:
+                exec_time = exec_time.replace(day=now.day + 1)
+
+            today_executions.append(exec_time)
+
+        return min(today_executions) if today_executions else None
 
     def _run_scheduler(self):
-        """Boucle principale du planificateur qui tourne en permanence"""
+        """Boucle principale du planificateur"""
+        logging.info("Thread du planificateur démarré")
+
         while self.running:
             try:
+                # Log périodique
+                if datetime.now().second % 300 == 0:
+                    next_run = self.get_next_execution()
+                    in_progress = self.config_manager.is_execution_in_progress(
+                    ) if self.config_manager else False
+                    logging.info(
+                        f"Planificateur actif - Prochaine exécution: {next_run} - En cours: {in_progress}")
+
                 schedule.run_pending()
-                time.sleep(60)  # Vérification toutes les minutes
+                time.sleep(30)
+
             except Exception as e:
                 logging.error(f"Erreur dans le planificateur: {e}")
                 time.sleep(60)
+
+        logging.info("Thread du planificateur arrêté")
 
 
 # Instance globale du planificateur
@@ -463,8 +629,7 @@ class GuruFocusApp:
                     st.error("Erreur lors de l'envoi du message de test")
 
     def _render_scheduler_section(self):
-        """Affiche la section du planificateur"""
-        # Vérifier si une configuration existe
+        """Affiche la section du planificateur avec statut persistant"""
         if not self.config.get('telegram', {}).get('bot_token'):
             st.warning(
                 "⚠️ Configuration Telegram manquante. Importez d'abord une configuration.")
@@ -473,46 +638,69 @@ class GuruFocusApp:
         current_times = self.config.get('schedule', {}).get(
             'execution_times', ['07:25', '19:35'])
 
-        # Affichage des heures actuelles
+        # Récupérer le statut détaillé
+        status_info = self.scheduler.get_execution_status()
+        is_running = status_info.get('running', False)
+        execution_in_progress = status_info.get('execution_in_progress', False)
+        last_execution = status_info.get('last_execution')
+        next_execution = status_info.get('next_execution')
+
         st.markdown("**Heures d'exécution programmées:**")
-        for i, time_str in enumerate(current_times):
+        for time_str in current_times:
             st.markdown(f"- {time_str}")
 
         # Statut du planificateur
-        is_running = self.scheduler.is_running()
-        status = "🟢 Actif" if is_running else "🔴 Inactif"
-        st.markdown(f"**Statut du planificateur:** {status}")
+        if execution_in_progress:
+            st.warning("🔄 Exécution en cours...")
+        elif is_running:
+            st.success("🟢 Planificateur actif")
+        else:
+            st.error("🔴 Planificateur inactif")
 
-        if is_running:
-            st.success(
-                "✅ Le bot fonctionne en arrière-plan et continuera même si vous fermez cette page")
-            st.markdown(
-                f"**Prochaines exécutions:** {', '.join(current_times)}")
-
-        # Contrôle du planificateur
+        # Informations détaillées
         col1, col2 = st.columns(2)
-
         with col1:
-            if st.button("▶️ Démarrer Bot", disabled=is_running):
-                if self._start_background_scheduler():
-                    st.success("Planificateur démarré en arrière-plan!")
-                    st.rerun()
-                else:
-                    st.error("Erreur lors du démarrage")
+            if next_execution:
+                st.info(
+                    f"🕐 Prochaine exécution:\n{next_execution.strftime('%d/%m/%Y à %H:%M')}")
+        with col2:
+            if last_execution:
+                st.info(
+                    f"✅ Dernière exécution:\n{last_execution.strftime('%d/%m/%Y à %H:%M')}")
+
+        # Contrôles
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("▶️ Démarrer Bot", disabled=is_running or execution_in_progress):
+                with st.spinner("Démarrage du planificateur..."):
+                    if self._start_background_scheduler():
+                        st.success("Planificateur démarré!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("Erreur lors du démarrage")
 
         with col2:
             if st.button("⏹️ Arrêter Bot", disabled=not is_running):
-                self.scheduler.stop_scheduler()
-                st.success("Planificateur arrêté!")
-                st.rerun()
+                with st.spinner("Arrêt du planificateur..."):
+                    self.scheduler.stop_scheduler()
+                    st.success("Planificateur arrêté!")
+                    time.sleep(1)
+                    st.rerun()
 
-        # Exécution manuelle
+        # Test manuel
         st.markdown("---")
-        if st.button("🚀 Exécuter Maintenant"):
+        if st.button("🚀 Exécuter Maintenant", disabled=execution_in_progress):
             with st.spinner("Analyse en cours..."):
                 self._execute_portfolio_analysis()
-                st.success(
-                    "Analyse terminée! Vérifiez les résultats ci-dessous.")
+                st.success("Analyse terminée!")
+
+        # Debug
+        with st.expander("🔧 Informations de debug"):
+            st.write(f"Thread actif: {status_info.get('thread_alive', False)}")
+            st.write(f"Statut persistant: {is_running}")
+            st.write(f"Exécution en cours: {execution_in_progress}")
+            st.write(f"Jobs programmés: {len(schedule.jobs)}")
 
     def _render_portfolio_section(self):
         """Affiche la section du portfolio"""
@@ -635,33 +823,41 @@ class GuruFocusApp:
             execution_times = self.config.get(
                 'schedule', {}).get('execution_times', [])
             if not execution_times:
-                st.error("Aucune heure d'exécution configurée")
+                logging.error("Aucune heure d'exécution configurée")
                 return False
 
             # Vérifier la configuration Telegram
             telegram_config = self.config.get('telegram', {})
             if not telegram_config.get('bot_token') or not telegram_config.get('chat_id'):
-                st.error("Configuration Telegram incomplète")
+                logging.error("Configuration Telegram incomplète")
                 return False
 
-            # Créer une fonction d'exécution qui utilise la configuration cachée
-            def execute_with_cached_config():
+            # Créer une fonction d'exécution qui utilise la configuration
+            def execute_with_config():
+                logging.info("Exécution programmée déclenchée")
                 self._execute_portfolio_analysis_background()
 
-            self.scheduler.start_scheduler(
-                execution_times, execute_with_cached_config, self.config_manager)
-            return True
+            # Démarrer le planificateur
+            success = self.scheduler.start_scheduler(
+                execution_times, execute_with_config, self.config_manager)
+
+            if success:
+                logging.info("Planificateur démarré avec succès")
+                return True
+            else:
+                logging.error("Échec du démarrage du planificateur")
+                return False
 
         except Exception as e:
             logging.error(f"Erreur lors du démarrage du planificateur: {e}")
             return False
 
     def _execute_portfolio_analysis_background(self):
-        """Exécute l'analyse du portfolio en arrière-plan avec la config cachée"""
+        """Exécute l'analyse du portfolio en arrière-plan"""
         try:
-            logging.info("Début de l'analyse du portfolio (arrière-plan)")
+            logging.info("=== DÉBUT ANALYSE PORTFOLIO (ARRIÈRE-PLAN) ===")
 
-            # Récupérer la configuration depuis le cache
+            # Récupérer la configuration depuis le fichier
             current_config = self.config_manager.get_config()
             portfolio = current_config.get('portfolio', [])
 
@@ -669,28 +865,41 @@ class GuruFocusApp:
                 logging.warning("Aucun ticker dans le portfolio")
                 return
 
+            logging.info(f"Analyse de {len(portfolio)} tickers")
+
             # Récupérer les données
             portfolio_data = []
             for stock in portfolio:
                 ticker = stock['ticker']
+                logging.info(f"Récupération des données pour {ticker}")
                 data = self.guru_api.get_stock_data(ticker)
                 data['in_portfolio'] = stock.get('in_portfolio', False)
                 portfolio_data.append(data)
                 time.sleep(1)  # Pause entre les requêtes
+
+            # Compter les succès
+            successful_data = [
+                d for d in portfolio_data if d.get('success', False)]
+            logging.info(
+                f"Données récupérées avec succès pour {len(successful_data)}/{len(portfolio_data)} tickers")
 
             # Envoyer via Telegram
             telegram_config = current_config.get('telegram', {})
             if telegram_config.get('bot_token') and telegram_config.get('chat_id'):
                 bot = TelegramBot(
                     telegram_config['bot_token'], telegram_config['chat_id'])
-                bot.send_message(portfolio_data)
+                if bot.send_message(portfolio_data):
+                    logging.info("Message Telegram envoyé avec succès")
+                else:
+                    logging.error("Échec de l'envoi du message Telegram")
+            else:
+                logging.error("Configuration Telegram manquante")
 
-            logging.info(
-                "Analyse du portfolio terminée avec succès (arrière-plan)")
+            logging.info("=== FIN ANALYSE PORTFOLIO (ARRIÈRE-PLAN) ===")
 
         except Exception as e:
             logging.error(
-                f"Erreur lors de l'analyse du portfolio (arrière-plan): {e}")
+                f"Erreur lors de l'analyse du portfolio (arrière-plan): {e}", exc_info=True)
 
     def _execute_portfolio_analysis(self):
         """Exécute l'analyse du portfolio pour l'interface utilisateur"""

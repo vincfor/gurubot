@@ -1,0 +1,86 @@
+{
+  "telegram": {
+    "bot_token": "",
+    "chat_id": ""
+  },
+  "schedule": {
+    "execution_times": [
+      "07:25",
+      "19:35"
+    ]
+  },
+  "portfolio": [
+    {
+      "ticker": "GOOGL",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "AMZN",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "BN",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "CPRT",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "EFX",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "INTU",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "META",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "MCO",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "MSCI",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "SPGI",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "VEEV",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "V",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "XPAR:RMS",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "ASML",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "XPAR:GTT",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "VRTX",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "FTNT",
+      "in_portofolio": true
+    },
+    {
+      "ticker": "FICO",
+      "in_portofolio": false
+    }
+  ]
+}
